@@ -1,6 +1,6 @@
 # Payment Fraud Prevention Agent — Architecture
 
-## High-Level Architecture
+## High-Level Architecture 
 
 ```
                           ┌─────────────────────────────────────────┐
