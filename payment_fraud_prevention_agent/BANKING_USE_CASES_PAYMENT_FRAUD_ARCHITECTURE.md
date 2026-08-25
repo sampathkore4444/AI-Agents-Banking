@@ -14,19 +14,19 @@
 ┌─────────────────────┐          ┌─────────────────────┐          ┌─────────────────────┐
 │   PAYMENT INGESTION │          │   FRAUD DETECTION   │          │   RESPONSE &        │
 │   LAYER             │          │   ENGINE            │          │   INVESTIGATION     │
-│                     │          │                      │          │                     │
-│ • Wire Transfers    │          │ • Rule Engine        │          │ • Block/Allow       │
-│ • ACH Processing    │◄────────►│ • ML Scoring         │◄────────►│ • Case Management   │
-│ • Check Clearing    │          │ • Sanctions Screen   │          │ • Notifications     │
-│ • RTP/FedNow/Zelle  │          │ • Velocity Check     │          │ • Recalls           │
+│                     │          │                     │          │                     │
+│ • Wire Transfers    │          │ • Rule Engine       │          │ • Block/Allow       │
+│ • ACH Processing    │◄────────►│ • ML Scoring        │◄────────►│ • Case Management   │
+│ • Check Clearing    │          │ • Sanctions Screen  │          │ • Notifications     │
+│ • RTP/FedNow/Zelle  │          │ • Velocity Check    │          │ • Recalls           │
 └─────────────────────┘          └─────────────────────┘          └─────────────────────┘
            │                                  │                                  │
            └──────────────────────────────────┼──────────────────────────────────┘
                                               │
                                               ▼
                           ┌─────────────────────────────────────────┐
-                          │              MCP SERVER                  │
-                          │         (40+ Tools Exposed)              │
+                          │              MCP SERVER                 │
+                          │         (40+ Tools Exposed)             │
                           └─────────────────────────────────────────┘
                                               │
            ┌──────────────────────────────────┼──────────────────────────────────┐
@@ -35,14 +35,14 @@
 ┌─────────────────────┐          ┌─────────────────────┐          ┌─────────────────────┐
 │   RAG KNOWLEDGE     │          │   EMBEDDING         │          │   LLM AGENT         │
 │   BASE              │          │   VECTOR DB         │          │   (Ollama/vLLM/     │
-│                     │          │                      │          │    SGLang)          │
-│ • Payment Policies  │          │ • Payment Embs       │          │                     │
-│ • Wire Fraud        │          │ • Customer Profiles  │          │ • Guardrails        │
-│ • ACH Fraud         │          │ • Fraud Patterns     │          │ • HITL              │
-│ • BEC Schemes       │          │ • Anomaly Scores     │          │ • Memory            │
-│ • Check Fraud       │          │                      │          │ • Streaming         │
-│ • RTP Risks         │          │                      │          │ • Observability     │
-│ • Playbooks         │          │                      │          │                     │
+│                     │          │                     │          │    SGLang)          │
+│ • Payment Policies  │          │ • Payment Embs      │          │                     │
+│ • Wire Fraud        │          │ • Customer Profiles │          │ • Guardrails        │
+│ • ACH Fraud         │          │ • Fraud Patterns    │          │ • HITL              │
+│ • BEC Schemes       │          │ • Anomaly Scores    │          │ • Memory            │
+│ • Check Fraud       │          │                     │          │ • Streaming         │
+│ • RTP Risks         │          │                     │          │ • Observability     │
+│ • Playbooks         │          │                     │          │                     │
 └─────────────────────┘          └─────────────────────┘          └─────────────────────┘
 ```
 
