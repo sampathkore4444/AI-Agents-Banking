@@ -2,9 +2,13 @@
 Deterministic end-to-end KYC onboarding runner.
 
 Executes the full Sathapana onboarding journey against the real tool
-handlers (RAG + MCP tools + audit trail) with no LLM required. Used by
-`python main.py demo`. Each scenario's screening outcomes can be pinned
-via `force_*` fields to demonstrate low / medium / high-risk journeys.
+handlers (RAG + MCP tools + audit trail + approval workflow + saga) with no
+LLM required. Used by `python main.py demo`. Each scenario's screening
+outcomes can be pinned via `force_*` fields to demonstrate low / medium /
+high-risk journeys. High-risk actions (customer profile, accounts, case
+updates) run through the `OnboardingSaga`, so approval requests, SLA
+deadlines and idempotent step keys are exercised exactly as they will be in
+production.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import logging
 
 import db
 from tools import get_registry
+from workflow.onboarding import build_saga
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +76,22 @@ def _apply_forced_screening(screen: dict, scenario: dict) -> dict:
     if forced:
         screen.update(forced)
     return screen
+
+
+def _run_saga_steps(registry, steps: list[tuple[str, dict | object]], scenario: dict) -> tuple[str, dict[str, dict]]:
+    """Execute onboarding steps through the saga; return (session_id, outputs)."""
+    import json as _json
+
+    saga = build_saga(registry=registry)
+    session = saga.start(scenario=scenario.get("name", ""), customer_key=scenario.get("name", ""))
+    session = saga.run_functional(session["session_id"], steps)
+    outputs: dict[str, dict] = {}
+    for step in session.get("steps", []):
+        try:
+            outputs[step["step"]] = _json.loads(step["output"])
+        except Exception:  # noqa: BLE001
+            outputs[step["step"]] = {}
+    return session["session_id"], outputs
 
 
 def run_scenario(scenario: dict, verbose: bool = True) -> dict:
@@ -172,7 +193,7 @@ def _decline(scenario: dict, customer_id: str, screen: dict, identity: dict, ubo
     if ubo_result.get("blocked_names"):
         flags.extend(ubo_result.get("blocked_names", []))
     if str_to_camfiu:
-        case = registry.invoke("open_compliance_case", {"customer_id": customer_id, "risk_level": "high", "summary": f"Onboarding declined: {reason}", "flags": flags, "priority": "urgent", "file_str_to_camfiu": True})
+        case = registry.invoke("open_compliance_case", {"customer_id": customer_id, "risk_level": "high", "summary": f"Onboarding declined: {reason}", "flags": flags, "priority": "urgent", "file_str_to_camfiu": True, "customer_pii": {"full_name": scenario["name"], "nationality": "KH"}})
     notify = registry.invoke("notify_customer", {"recipient_id": customer_id, "channel": "sms", "template_id": "kyc_rejected", "variables": {"customer_name": scenario["name"]}})
     db.log_action("runner", "onboarding_declined", {"customer": scenario["name"], "reason": reason, "str": str_to_camfiu})
     return {"status": "declined", "reason": reason or flags, "str_filed_camfiu": str_to_camfiu, "case": (case or {}).get("case_id"), "notification": notify.get("notification_id")}
@@ -183,19 +204,27 @@ def _approve(scenario: dict, customer_id: str, screen: dict, identity: dict, ubo
         if verbose:
             print(f"  {msg}")
 
-    profile = registry.invoke("create_customer_profile", {
-        "personal_info": {"full_name": scenario["name"], "nationality": "KH"},
-        "address": {"village": "Phsar Depo", "commune": "Toul Tompoung", "district": "Chamkar Mon", "province": "Phnom Penh"},
-        "kyc_result": "approved", "risk_rating": "low",
-        "currency": scenario.get("currency", "USD"), "customer_type": scenario.get("customer_type", "individual"),
-        "documents_verified": docs_verified,
-    })
-    account = registry.invoke("open_account", {"customer_id": profile["customer_id"], "account_type": "retail_savings" if scenario["customer_type"] == "individual" else "sme_loan", "currency": scenario.get("currency", "USD")})
-    bakong = registry.invoke("register_bakong", {"customer_id": profile["customer_id"], "account_id": account["account_id"], "mobile_number": "012-345678", "currency": scenario.get("currency", "USD")})
-    notify = registry.invoke("notify_customer", {"recipient_id": profile["customer_id"], "template_id": "kyc_approved", "variables": {"customer_name": scenario["name"], "product": "account", "account_id": account["account_id"]}})
-    v(f"  7) Approved -> customer={profile['customer_id']} account={account['account_id']} ({account['currency']}) Bakong={bakong['bakong_id']}")
-    db.log_action("runner", "onboarding_approved", {"customer": scenario["name"], "account": account["account_id"], "bakong": bakong["bakong_id"]})
-    return {"status": "approved", "customer_id": profile["customer_id"], "account_id": account["account_id"], "bakong_id": bakong["bakong_id"], "risk": "low", "notification": notify.get("notification_id")}
+    steps: list[tuple[str, object]] = [
+        ("create_customer_profile", lambda o: ("create_customer_profile", {
+            "personal_info": {"full_name": scenario["name"], "nationality": "KH"},
+            "address": {"village": "Phsar Depo", "commune": "Toul Tompoung", "district": "Chamkar Mon", "province": "Phnom Penh"},
+            "kyc_result": "approved", "risk_rating": "low",
+            "currency": scenario.get("currency", "USD"), "customer_type": scenario.get("customer_type", "individual"),
+            "documents_verified": docs_verified,
+        })),
+        ("open_account", lambda o: ("open_account", {"customer_id": o["create_customer_profile"]["customer_id"], "account_type": "retail_savings" if scenario["customer_type"] == "individual" else "sme_loan", "currency": scenario.get("currency", "USD")})),
+        ("register_bakong", lambda o: ("register_bakong", {"customer_id": o["create_customer_profile"]["customer_id"], "account_id": o["open_account"]["account_id"], "mobile_number": "012-345678", "currency": scenario.get("currency", "USD")})),
+        ("notify_customer", lambda o: ("notify_customer", {"recipient_id": o["create_customer_profile"]["customer_id"], "template_id": "kyc_approved", "variables": {"customer_name": scenario["name"], "product": "account", "account_id": o["open_account"]["account_id"]}})),
+    ]
+    session_id, outputs = _run_saga_steps(registry, steps, scenario)
+    profile = outputs.get("create_customer_profile", {})
+    account = outputs.get("open_account", {})
+    bakong = outputs.get("register_bakong", {})
+
+    v(f"  7) SAGA {session_id} complete (approval auto-granted, idempotent steps)")
+    v(f"     Approved -> customer={profile.get('customer_id')} account={account.get('account_id')} ({account.get('currency')}) Bakong={bakong.get('bakong_id')}")
+    db.log_action("runner", "onboarding_approved", {"customer": scenario["name"], "account": account.get("account_id"), "bakong": bakong.get("bakong_id"), "session": session_id})
+    return {"status": "approved", "customer_id": profile.get("customer_id"), "account_id": account.get("account_id"), "bakong_id": bakong.get("bakong_id"), "risk": "low", "session": session_id}
 
 
 def _review_and_approve(scenario: dict, customer_id: str, screen: dict, identity: dict, ubo_result: dict, risk: dict, docs_verified: list, registry) -> dict:
@@ -203,18 +232,26 @@ def _review_and_approve(scenario: dict, customer_id: str, screen: dict, identity
     case = registry.invoke("open_compliance_case", {
         "customer_id": customer_id, "risk_level": risk.get("risk_level"), "summary": f"EDD required for {scenario['name']}", "flags": risk.get("flags", [])})
     print(f"  [HITL] compliance officer reviews case {case['case_id']}...")
-    case = registry.invoke("update_case", {"case_id": case["case_id"], "status": "approved", "assigned_to": "MLRO", "decision": "approved_with_conditions", "notes": "EDD complete; source of funds verified."})
-    profile = registry.invoke("create_customer_profile", {
-        "personal_info": {"full_name": scenario["name"], "nationality": "KH"},
-        "address": {"village": "Kbal Koh", "commune": "Prek Pnov", "district": "Prek Pnov", "province": "Phnom Penh"},
-        "kyc_result": "approved_with_conditions", "risk_rating": "medium",
-        "currency": scenario.get("currency", "USD"), "customer_type": scenario.get("customer_type", "individual"),
-        "documents_verified": docs_verified, "kyc_case_id": case["case_id"],
-    })
-    account = registry.invoke("open_account", {"customer_id": profile["customer_id"], "account_type": "sme_loan", "currency": scenario.get("currency", "USD")})
-    bakong = registry.invoke("register_bakong", {"customer_id": profile["customer_id"], "account_id": account["account_id"], "mobile_number": "016-987654", "currency": scenario.get("currency", "USD")})
-    db.log_action("runner", "onboarding_approved_with_conditions", {"customer": scenario["name"], "case": case["case_id"], "account": account["account_id"]})
-    return {"status": "approved_with_conditions", "customer_id": profile["customer_id"], "account_id": account["account_id"], "bakong_id": bakong["bakong_id"], "case_id": case["case_id"], "risk": "medium"}
+
+    steps: list[tuple[str, object]] = [
+        ("update_case", lambda o: ("update_case", {"case_id": case["case_id"], "status": "approved", "assigned_to": "MLRO", "decision": "approved_with_conditions", "notes": "EDD complete; source of funds verified."})),
+        ("create_customer_profile", lambda o: ("create_customer_profile", {
+            "personal_info": {"full_name": scenario["name"], "nationality": "KH"},
+            "address": {"village": "Kbal Koh", "commune": "Prek Pnov", "district": "Prek Pnov", "province": "Phnom Penh"},
+            "kyc_result": "approved_with_conditions", "risk_rating": "medium",
+            "currency": scenario.get("currency", "USD"), "customer_type": scenario.get("customer_type", "individual"),
+            "documents_verified": docs_verified, "kyc_case_id": case["case_id"],
+        })),
+        ("open_account", lambda o: ("open_account", {"customer_id": o["create_customer_profile"]["customer_id"], "account_type": "sme_loan", "currency": scenario.get("currency", "USD")})),
+        ("register_bakong", lambda o: ("register_bakong", {"customer_id": o["create_customer_profile"]["customer_id"], "account_id": o["open_account"]["account_id"], "mobile_number": "016-987654", "currency": scenario.get("currency", "USD")})),
+        ("notify_customer", lambda o: ("notify_customer", {"recipient_id": o["create_customer_profile"]["customer_id"], "template_id": "kyc_approved", "variables": {"customer_name": scenario["name"], "product": "account", "account_id": o["open_account"]["account_id"]}})),
+    ]
+    session_id, outputs = _run_saga_steps(registry, steps, scenario)
+    profile = outputs.get("create_customer_profile", {})
+    account = outputs.get("open_account", {})
+
+    db.log_action("runner", "onboarding_approved_with_conditions", {"customer": scenario["name"], "case": case["case_id"], "account": account.get("account_id"), "session": session_id})
+    return {"status": "approved_with_conditions", "customer_id": profile.get("customer_id"), "account_id": account.get("account_id"), "bakong_id": outputs.get("register_bakong", {}).get("bakong_id"), "case_id": case["case_id"], "risk": "medium", "session": session_id}
 
 
 def run_demo() -> dict:

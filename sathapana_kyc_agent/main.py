@@ -2,10 +2,14 @@
 Sathapana Bank KYC Onboarding Agent — CLI entrypoint.
 
 Commands:
-    python main.py seed      Populate the NBC/Sathapana knowledge base.
-    python main.py demo      Run the end-to-end onboarding demo (no LLM needed).
-    python main.py chat      Interactive chat via a local Ollama model.
-    python main.py serve     Start the MCP stdio server.
+    python main.py seed                    Populate the NBC/Sathapana knowledge base.
+    python main.py demo                    Run the end-to-end onboarding demo (no LLM needed).
+    python main.py chat                    Interactive chat via a local Ollama model.
+    python main.py serve [--transport stdio|tcp]   Start the (hardened) MCP server.
+    python main.py serve-api [--port 8000]         Start the HTTP REST + OpenAPI (Swagger) server.
+    python main.py eval-rag                Run the golden-set RAG evaluation.
+    python main.py verify-audit            Verify the tamper-evident audit chain.
+    python main.py providers               Show configured vendor provider adapters.
 """
 
 from __future__ import annotations
@@ -56,7 +60,40 @@ async def cmd_chat(model_name: str = "llama3.1:8b", auto_approve: bool = False) 
 def cmd_serve() -> None:
     import server
 
-    server.main()
+    transport = "tcp" if "--transport" in sys.argv and sys.argv[sys.argv.index("--transport") + 1] == "tcp" else None
+    server.main(transport=transport)
+
+
+def cmd_serve_api() -> None:
+    import api_server
+
+    args = sys.argv[2:]
+    host = args[args.index("--host") + 1] if "--host" in args else "127.0.0.1"
+    port = int(args[args.index("--port") + 1]) if "--port" in args else 8000
+    api_server.serve(host=host, port=port, log_requests="--verbose" in args)
+
+
+def cmd_eval_rag() -> None:
+    import rag_eval
+
+    rag_eval.print_rag_eval()
+
+
+def cmd_verify_audit() -> None:
+    result = db.verify_audit_chain()
+    ok = result.get("ok")
+    print(f"Audit chain: {'INTACT' if ok else 'TAMPERED'} ({result.get('rows_checked')} rows checked)")
+    if not ok:
+        print(f"  First bad entry id: {result.get('first_bad_id')}")
+    if result.get("legacy_rows"):
+        print(f"  Legacy (un-hashed) rows skipped: {result.get('legacy_rows')}")
+
+
+def cmd_providers() -> None:
+    from integrations import get_providers
+
+    for kind, name in get_providers().summary().items():
+        print(f"  {kind:12s} -> {name}")
 
 
 def main() -> None:
@@ -74,6 +111,14 @@ def main() -> None:
         asyncio.run(cmd_chat(model, auto_approve))
     elif cmd == "serve":
         cmd_serve()
+    elif cmd == "serve-api":
+        cmd_serve_api()
+    elif cmd == "eval-rag":
+        cmd_eval_rag()
+    elif cmd == "verify-audit":
+        cmd_verify_audit()
+    elif cmd == "providers":
+        cmd_providers()
     else:
         print(__doc__)
 

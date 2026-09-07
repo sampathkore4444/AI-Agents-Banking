@@ -12,6 +12,9 @@ import uuid
 from datetime import datetime, timezone
 
 import db
+from config import settings
+from integrations import get_providers
+from integrations.camfiu import build_str_record
 
 
 def _now() -> str:
@@ -25,8 +28,13 @@ def create_compliance_case(
     flags: list[str] | None = None,
     priority: str = "medium",
     file_str_to_camfiu: bool = False,
+    customer_pii: dict | None = None,
 ) -> dict:
-    """Create a compliance review case for manual officer review."""
+    """Create a compliance review case for manual officer review.
+
+    customer_pii (optional) supplies the identity for STR filing when the
+    applicant was declined before a customer row existed.
+    """
     db.init_db()
     case_id = f"CASE-{uuid.uuid4().hex[:8].upper()}"
     flags = flags or []
@@ -45,19 +53,45 @@ def create_compliance_case(
 
     case = get_compliance_case(case_id)
     if file_str_to_camfiu:
-        case["str_filed_camfiu"] = _file_str_to_camfiu(case_id, summary, flags)
+        case["str_filed_camfiu"] = _file_str_to_camfiu(case_id, summary, flags, customer=customer_pii)
     return case
 
 
-def _file_str_to_camfiu(case_id: str, summary: str, flags: list[str]) -> dict:
-    """Simulated filing of a Suspicious Transaction Report to CAMFIU."""
-    db.log_action("compliance", "file_str_camfiu", {"case_id": case_id, "flags": flags}, "ok")
-    return {
-        "str_reference": f"STR-{uuid.uuid4().hex[:10].upper()}",
-        "authority": "Cambodia Financial Intelligence Unit (CAMFIU)",
-        "submitted_at": _now(),
-        "summary": summary,
-    }
+def _file_str_to_camfiu(case_id: str, summary: str, flags: list[str], customer: dict | None = None) -> dict:
+    """Build + validate an STR and transmit it to CAMFIU via the configured provider.
+
+    Returns the STR reference and validation summary, or a validation_error
+    listing missing mandatory fields (nothing is filed when invalid).
+    """
+    if customer is None:
+        customer = db_customer_pii(case_id)
+    record, info = build_str_record(
+        {"case_id": case_id, "summary": summary, "flags": flags, "risk_level": "high", "bank_name": "Sathapana Bank PLC"},
+        customer,
+        agent_id="sathapana-kyc-agent",
+    )
+    if record is None:
+        db.log_action("compliance", "file_str_camfiu_rejected", info, status="error")
+        return info
+
+    result = get_providers().camfiu.file(record)
+    db.log_action("compliance", "file_str_camfiu", {"case_id": case_id, "str_reference": result.get("str_reference"), "flags": flags, "validation": "passed"}, "ok")
+    result.setdefault("validation", "passed")
+    return result
+
+
+def db_customer_pii(case_id: str) -> dict | None:
+    """Resolve the customer PII tied to a compliance case (for STR narrative)."""
+    from tools import core_banking
+
+    conn = db._connect()
+    try:
+        row = conn.execute("SELECT customer_id FROM compliance_cases WHERE case_id = ?", (case_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return core_banking.get_customer_pii(row["customer_id"])
 
 
 def get_compliance_case(case_id: str) -> dict:

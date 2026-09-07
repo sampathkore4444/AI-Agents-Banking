@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from sentence_transformers import SentenceTransformer
 
 from config import settings
-from vector_store import VectorStore
+from vector_store import get_vector_store, VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,45 @@ COLLECTIONS = [
     "risk_typologies",
     "past_kyc_decisions",
 ]
+
+# Domain term expansion: map short forms to full phrases (and reverse) so a
+# compact query like "EDD PEP STR casino" retrieves the right NBC/FATF chunks.
+QUERY_EXPANSIONS = {
+    "EDD": "enhanced due diligence",
+    "CDD": "customer due diligence",
+    "KYC": "know your customer",
+    "AML": "anti-money laundering",
+    "CFT": "countering the financing of terrorism",
+    "UBO": "beneficial owner",
+    "PEP": "politically exposed person",
+    "STR": "suspicious transaction report",
+    "SAR": "suspicious activity report",
+    "PEPs": "politically exposed persons",
+    "FATF": "financial action task force",
+}
+
+# Domain synonyms: expansion terms that otherwise reduce recall (the KB uses
+# "gambling"/"casino junket" where queries tend to say "gaming", etc.).
+DOMAIN_SYNONYMS = {
+    "gaming": "gambling casino junket",
+    "casino": "gambling junket",
+    "gambling": "gaming casino junket",
+}
+
+
+def expand_query(query: str) -> str:
+    """Expand domain acronyms and synonyms into full phrases to improve recall."""
+    if not query:
+        return query
+    expanded = query
+    for acronym, phrase in QUERY_EXPANSIONS.items():
+        if re.search(rf"\b{acronym}\b", query):
+            expanded = f"{expanded} {phrase}"
+    for term, phrase in DOMAIN_SYNONYMS.items():
+        if re.search(rf"\b{term}\b", query):
+            expanded = f"{expanded} {phrase}"
+    expanded = " ".join(expanded.split())
+    return expanded
 
 
 # ── Data classes ──────────────────────────────────────────────────
@@ -54,10 +93,23 @@ class RAGPipeline:
 
     def __init__(self) -> None:
         self._embedding_model = SentenceTransformer(settings.embedding_model)
-        self._store = VectorStore()
+        self._store = get_vector_store()
         for name in COLLECTIONS:
             full = f"{settings.vector_collection_prefix}_{name}"
             self._store.get_or_create_collection(full)
+        self._reranker_model = None
+        if settings.reranker_enabled:
+            self._init_reranker()
+
+    def _init_reranker(self) -> None:
+        try:
+            from sentence_transformers import CrossEncoder
+
+            self._reranker_model = CrossEncoder(settings.reranker_model)
+            logger.info("Reranker active: %s", settings.reranker_model)
+        except Exception as exc:  # noqa: BLE001 - graceful fallback to fusion ranking
+            self._reranker_model = None
+            logger.warning("Reranker unavailable (%s); falling back to fusion ranking", exc)
 
     @property
     def store(self) -> VectorStore:
@@ -125,6 +177,16 @@ class RAGPipeline:
         return merged[:n]
 
     def _rerank(self, chunks: list[RetrievedChunk], top_k: int = 5) -> list[RetrievedChunk]:
+        if not chunks:
+            return chunks
+        if self._reranker_model is not None:
+            try:
+                pairs = [[chunk.text, "-"] for chunk in chunks]
+                scores = self._reranker_model.predict(pairs)
+                for chunk, score in zip(chunks, scores):
+                    chunk.score = round(float(score), 4)
+            except Exception as exc:  # noqa: BLE001 - fallback on reranker failure
+                logger.warning("Rerank inference failed (%s); using fusion scores", exc)
         chunks.sort(key=lambda c: c.score, reverse=True)
         return chunks[:top_k]
 
@@ -143,8 +205,9 @@ class RAGPipeline:
         top_k: int = 5,
         collections: list[str] | None = None,
     ) -> RAGResult:
-        query_embedding = self._embed(user_query)
-        query_tokens = self._tokenize(user_query)
+        expanded = expand_query(user_query)
+        query_embedding = self._embed(expanded)
+        query_tokens = self._tokenize(expanded)
         all_chunks: list[RetrievedChunk] = []
         for col_name in collections or COLLECTIONS:
             full = f"{settings.vector_collection_prefix}_{col_name}"
@@ -156,7 +219,7 @@ class RAGPipeline:
         return RAGResult(
             chunks=reranked,
             assembled_context=self._assemble_context(reranked),
-            query_rewrite=user_query,
+            query_rewrite=expanded,
         )
 
     def query_single(self, collection_name: str, user_query: str, n_results: int = 5) -> list[RetrievedChunk]:

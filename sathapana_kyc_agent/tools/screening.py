@@ -1,9 +1,9 @@
 """
 Sanctions, PEP and Beneficial Ownership Screening — MCP tool stubs.
 
-Sathapana/NBC-aligned lists: UN Consolidated List (incl. UNSCR 1267/1989),
-NBC/Cambodia-targeted financial sanctions, OFAC, EU, plus a domestic
-Cambodian PEP list. Deterministic hash-based results for development.
+Screening delegates to the configured `integrations.sanctions.SanctionsProvider`
+(stub by default; point it at a live feed in production). UBO threshold logic
+remains in-process (NBC/FATF rules).
 """
 
 from __future__ import annotations
@@ -15,52 +15,20 @@ from datetime import datetime, timezone
 from config import settings
 
 
-def _hash_val(text: str) -> int:
-    return int(hashlib.md5(text.lower().encode()).hexdigest()[:8], 16) % 100
-
-
 def screen_customer_sanctions(
     full_name: str,
     date_of_birth: str,
     nationality: str = "KH",
     aliases: list[str] | None = None,
 ) -> dict:
-    """Screen a customer against UNSC, NBC/Cambodia, OFAC and EU lists + PEP."""
-    h = _hash_val(full_name)
+    """Screen a customer against the configured sanctions/PEP provider."""
+    from integrations import get_providers
 
-    un_result = "clear" if h > 8 else "potential_match"
-    nbc_result = "clear" if h > 8 else "potential_match"
-    ofac_result = "clear" if h > 10 else "potential_match"
-    eu_result = "clear" if h > 10 else "potential_match"
+    return get_providers().sanctions.screen(full_name, date_of_birth, nationality, aliases or [])
 
-    # Domestic (Cambodia) PEP: high-level officials, ministers, deputies, etc.
-    pep_status = "not_pep" if h > 20 else ("foreign_pep" if "kh" not in nationality.lower() else "domestic_pep")
-    adverse_media = h < 6
 
-    has_hits = any(r != "clear" for r in (un_result, nbc_result, ofac_result, eu_result))
-    if has_hits:
-        risk = "critical" if un_result != "clear" else "high"
-    elif pep_status != "not_pep" or adverse_media:
-        risk = "medium"
-    else:
-        risk = "low"
-
-    return {
-        "screening_id": str(uuid.uuid4()),
-        "customer_name": full_name,
-        "date_of_birth": date_of_birth,
-        "nationality": nationality,
-        "un_result": un_result,
-        "nbc_cambodia_result": nbc_result,
-        "ofac_result": ofac_result,
-        "eu_result": eu_result,
-        "pep_status": pep_status,
-        "adverse_media": adverse_media,
-        "risk_level": risk,
-        "onboarding_prohibited": un_result != "clear",
-        "screened_at": datetime.now(timezone.utc).isoformat(),
-        "aliases_checked": aliases or [],
-    }
+def _score_name(name: str) -> int:
+    return int(hashlib.md5(name.lower().encode()).hexdigest()[:8], 16) % 100 if name else 100
 
 
 def screen_ubo(owners: list[dict], risk_level: str = "low") -> dict:
@@ -80,7 +48,7 @@ def screen_ubo(owners: list[dict], risk_level: str = "low") -> dict:
     for owner in owners or []:
         pct = float(owner.get("ownership_pct", 0))
         name = owner.get("full_name", "")
-        screening = _hash_val(name)
+        screening = _score_name(name)
 
         captured = pct >= threshold
         hit = screening < 6

@@ -210,16 +210,34 @@ class ToolRegistry:
             lines.append(f"- {t['name']} [{t['risk_level']}]: {t['description']} (params: {params})")
         return "\n".join(lines)
 
-    def invoke(self, name: str, arguments: dict) -> dict:
+    def invoke(self, name: str, arguments: dict, idempotency_key: str | None = None) -> dict:
         tool = self._tools.get(name)
         if not tool:
             return {"error": f"Unknown tool: {name}"}
+        args = dict(arguments or {})
+        key = idempotency_key or args.pop("_idempotency_key", None)
+        if key:
+            import db
+
+            cached = db.get_idempotent(key)
+            if cached is not None:
+                return {"result": cached, "idempotent_replay": True}
         try:
-            return tool["handler"](**arguments)
+            result = tool["handler"](**args)
         except TypeError as exc:
             return {"error": f"Invalid arguments for {name}: {exc}"}
         except Exception as exc:  # noqa: BLE001 - surface tool errors to caller
             return {"error": f"{name} failed: {exc}"}
+        if key:
+            import db
+
+            db.store_idempotent(key, name, args, {"result": result})
+            db.log_action("registry", "tool_invoke", {"tool": name, "args": args, "idempotency_key": key}, "ok")
+        else:
+            import db
+
+            db.log_action("registry", "tool_invoke", {"tool": name, "args": args}, "ok")
+        return result
 
 
 def build_registry() -> ToolRegistry:
@@ -384,8 +402,8 @@ def _bakong_wrapper(**kw: Any) -> dict:
     return bakong.register_bakong(**kw)
 
 
-def _open_case_wrapper(customer_id: str, risk_level: str, summary: str, flags: list[str] | None = None, priority: str = "medium", file_str_to_camfiu: bool = False) -> dict:
-    return compliance.create_compliance_case(customer_id, risk_level, summary, flags, priority, file_str_to_camfiu)
+def _open_case_wrapper(customer_id: str, risk_level: str, summary: str, flags: list[str] | None = None, priority: str = "medium", file_str_to_camfiu: bool = False, customer_pii: dict | None = None) -> dict:
+    return compliance.create_compliance_case(customer_id, risk_level, summary, flags, priority, file_str_to_camfiu, customer_pii=customer_pii)
 
 
 def _get_case_wrapper(case_id: str) -> dict:

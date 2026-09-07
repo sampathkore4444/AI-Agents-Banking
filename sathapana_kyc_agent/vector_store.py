@@ -144,3 +144,75 @@ class VectorStore:
 # ── helper for callers that generate ids ─────────────────────────
 def gen_id(prefix: str = "doc") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+# ── backend factory ───────────────────────────────────────────────
+def get_vector_store() -> VectorStore:
+    """Instantiate the configured vector store backend.
+
+    numpy (default, zero dependencies) | chromadb (needs `pip install
+    chromadb`). A missing chromadb package raises an informative error so a
+    misconfigured deployment fails fast.
+    """
+    backend = settings.vector_backend.lower()
+    if backend == "numpy":
+        return VectorStore()
+    if backend in ("chroma", "chromadb"):
+        try:
+            import chromadb  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "vector_backend=chromadb is configured but the 'chromadb' package is not installed. "
+                "Install it ('python -m pip install chromadb') or set VECTOR_BACKEND=numpy."
+            ) from exc
+        return _ChromaVectorStore()
+
+    raise ValueError(f"Unknown vector_backend: {settings.vector_backend} (use 'numpy' or 'chromadb')")
+
+
+class _ChromaVectorStore:
+    """Thin ChromaDB adapter exposing the same collection API as VectorStore."""
+
+    def __init__(self) -> None:
+        import chromadb
+
+        self._client = chromadb.PersistentClient(path=os.path.join(settings.data_dir, "chroma"))
+        self._collections: dict[str, Any] = {}
+
+    def get_or_create_collection(self, name: str) -> str:
+        if name not in self._collections:
+            self._collections[name] = self._client.get_or_create_collection(name=name)
+        return name
+
+    def list_collections(self) -> list[str]:
+        return [c.name for c in self._client.list_collections()]
+
+    def count(self, name: str) -> int:
+        if name not in self._collections:
+            return 0
+        return self._collections[name].count()
+
+    def add(self, name: str, ids: list[str], documents: list[str], metadatas: list[dict], embeddings: list[list[float]]) -> None:
+        self.get_or_create_collection(name)
+        self._collections[name].add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+
+    def reset(self, name: str) -> None:
+        if name in self._collections:
+            self._client.delete_collection(name=name)
+            del self._collections[name]
+
+    def query(self, name: str, embedding: list[float], n_results: int = 10) -> list[dict]:
+        if name not in self._collections or self.count(name) == 0:
+            return []
+        hits = self._collections[name].query(query_embeddings=[embedding], n_results=n_results, include=["documents", "metadatas", "distances"])
+        out = []
+        for i, doc in enumerate(hits["documents"][0]):
+            out.append(
+                {
+                    "id": hits["ids"][0][i],
+                    "document": doc,
+                    "metadata": hits["metadatas"][0][i],
+                    "score": float(1.0 - hits["distances"][0][i]),
+                }
+            )
+        return out

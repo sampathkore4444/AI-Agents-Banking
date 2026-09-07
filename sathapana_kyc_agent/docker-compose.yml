@@ -1,0 +1,30 @@
+# Sathapana KYC Agent — quick start with Docker Compose.
+#
+#   docker compose up -d          build + start REST API / Swagger UI on :8000
+#   docker compose ps             status
+#   docker compose logs -f        follow logs
+#   docker compose down           stop containers (data volume is preserved)
+#   docker compose run --rm kyc-agent python main.py demo     run a one-off command
+#
+# The repo dir is bind-mounted at /app so .env (crypto keys) and data/
+# (SQLite + vector store) persist on the host and match your local runs.
+services:
+  kyc-agent:
+    build: .
+    image: sathapana-kyc-agent:latest
+    container_name: sathapana-kyc
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - .:/app
+    working_dir: /app
+    restart: unless-stopped
+    # Set the MCP/REST auth token via .env (host file is mounted at /app/.env).
+    # env_file:
+    #   - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

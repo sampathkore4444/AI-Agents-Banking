@@ -20,6 +20,7 @@ from typing import Any
 
 import db
 from tools import get_rag, get_registry
+from workflow.approvals import build_approval_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -93,29 +94,6 @@ class Guardrails:
         return text
 
 
-class ApprovalManager:
-    """Human-in-the-loop approval for high-risk tool calls."""
-
-    def __init__(self, auto_approve: bool = False) -> None:
-        self.auto_approve = auto_approve
-        self.pending: dict[str, dict] = {}
-        self.decisions: dict[str, bool] = {}
-
-    def request_approval(self, tool_call: ToolCall) -> tuple[bool, str]:
-        approval_id = str(uuid.uuid4())[:8]
-        if self.auto_approve:
-            tool_call.approved = True
-            return True, "Auto-approved (dev mode)"
-        print(f"\n  [AUDIT] Approval required for '{tool_call.name}': {json.dumps(tool_call.arguments)[:200]}")
-        choice = input("  Approve? (yes/no) [yes]: ").strip().lower()
-        approved = choice in ("", "yes", "y", "1")
-        self.decisions[approval_id] = approved
-        self.pending.pop(approval_id, None)
-        tool_call.approved = approved
-        tool_call.approval_reason = "Approved by officer" if approved else "Rejected by officer"
-        return approved, tool_call.approval_reason
-
-
 # ══════════════════════════════════════════════════════════════════
 #  MEMORY
 # ══════════════════════════════════════════════════════════════════
@@ -170,7 +148,74 @@ class BaseAgent(ABC):
         self.registry = get_registry()
         self.memory = ConversationMemory()
         self.guardrails = Guardrails()
-        self.approvals = ApprovalManager(auto_approve=auto_approve)
+        self.approvals = build_approval_workflow()
+
+    # ── approval decisions ────────────────────────────────────────
+    def _approve_tool(self, tool_call: ToolCall) -> None:
+        """Route a high-risk call through the DB-backed approval workflow.
+
+        Auto-approve (dev) or prompt the officer interactively (chat). The
+        executed side effect is idempotent: retrying a decision never runs a
+        tool twice.
+        """
+        request = self.approvals.submit(tool_call.name, tool_call.arguments, requested_by=self.run_id)
+        if "error" in request:
+            tool_call.approved = False
+            tool_call.approval_reason = str(request["error"])
+            tool_call.error = f"Approval rejected: {request['error']}"
+            self._record_execution(tool_call, {"error": tool_call.error})
+            return
+
+        approved = False
+        reason = ""
+        if self.auto_approve:
+            decision = "approved"
+            reason = "auto-approved (dev mode)"
+            notes = "Auto-approved (dev mode)"
+        else:
+            print(f"\n  [AUDIT] Approval required for '{tool_call.name}': {json.dumps(tool_call.arguments)[:200]}")
+            print(f"          Request {request['request_id']} (SLA {self.approvals.sla_seconds}s; pending: {len(self.approvals.pending())})")
+            choice = input("  Approve? (yes/no) [yes]: ").strip().lower()
+            approved = choice in ("", "yes", "y", "1")
+            decision = "approved" if approved else "rejected"
+            reason = "Approved by officer" if approved else "Rejected by officer"
+            notes = "officer decision: " + decision
+
+        outcome = self.approvals.decide(
+            request["request_id"],
+            decision,
+            decided_by=self.approvals.officer_id,
+            notes=notes,
+            executor=self.registry.invoke,
+        )
+        tool_call.approved = decision != "rejected"
+        tool_call.approval_reason = reason
+        if "error" in outcome:
+            tool_call.approved = False
+            tool_call.approval_reason = ""
+            tool_call.error = str(outcome["error"])
+            self._record_execution(tool_call, outcome)
+            return
+        if decision == "rejected":
+            tool_call.approved = False
+            tool_call.error = f"Rejected by officer: {reason}"
+            self._record_execution(tool_call, {"error": tool_call.error})
+            return
+        if outcome.get("executed"):
+            result = outcome.get("result", outcome)
+            self._record_execution(tool_call, result)
+        else:
+            tool_call.error = f"Tool execution skipped: {outcome.get('message', '')}"
+            self._record_execution(tool_call, {"error": tool_call.error})
+
+    def _record_execution(self, tool_call: ToolCall, result: dict) -> None:
+        if "error" in result:
+            tool_call.error = str(result["error"])
+            status = "error"
+        else:
+            tool_call.result = result
+            status = "ok"
+        db.log_action(self.run_id, f"tool:{tool_call.name}", {"arguments": tool_call.arguments, "result": result, "risk": self.registry.risk(tool_call.name)}, status)
 
     # ── LLM backend ───────────────────────────────────────────────
     @abstractmethod
@@ -184,20 +229,12 @@ class BaseAgent(ABC):
         tool_call.risk_level = risk
 
         if self.guardrails.requires_approval(tool_call.name):
-            approved, reason = self.approvals.request_approval(tool_call)
-            if not approved:
-                tool_call.error = f"Rejected by officer: {reason}"
-                db.log_action(self.run_id, f"tool:{tool_call.name}", {"arguments": tool_call.arguments, "error": tool_call.error}, "rejected")
-                return tool_call
-            db.log_action(self.run_id, f"approval:{tool_call.name}", {"decision": "approved"}, "ok")
-
-        result = self.registry.invoke(tool_call.name, tool_call.arguments)
-        tool_call.duration_ms = (time.time() - start) * 1000
-        if "error" in result:
-            tool_call.error = str(result["error"])
+            self._approve_tool(tool_call)
         else:
-            tool_call.result = result
-        db.log_action(self.run_id, f"tool:{tool_call.name}", {"arguments": tool_call.arguments, "result": result, "risk": risk}, "error" if tool_call.error else "ok")
+            result = self.registry.invoke(tool_call.name, tool_call.arguments, f"agent:{self.run_id}:{tool_call.id}")
+            self._record_execution(tool_call, result)
+
+        tool_call.duration_ms = (time.time() - start) * 1000
         return tool_call
 
     # ── simple RAG route (no LLM) ─────────────────────────────────

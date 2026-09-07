@@ -106,10 +106,10 @@ def test_screen_sanctions_structure() -> None:
 
 
 def test_screen_sanctions_hit_forces_prohibited(monkeypatch) -> None:
-    import tools.screening as screening
+    import integrations.sanctions as sanctions_mod
 
-    monkeypatch.setattr(screening, "_hash_val", lambda text: 0)
-    result = screening.screen_customer_sanctions("Sanctioned Person", "1980-01-01")
+    monkeypatch.setattr(sanctions_mod, "_hash_val", lambda text: 0)
+    result = sanctions_mod.StubSanctionsProvider().screen("Sanctioned Person", "1980-01-01", "KH")
     assert result["un_result"] == "potential_match"
     assert result["onboarding_prohibited"] is True
     assert result["risk_level"] == "critical"
@@ -175,7 +175,7 @@ def test_core_banking_flow() -> None:
 
 def test_compliance_case_with_str() -> None:
     reg = get_registry()
-    case = reg.invoke("open_compliance_case", {"customer_id": "CUST-TEST2", "risk_level": "high", "summary": "Suspicious cash flows and gambling links", "flags": ["gambling_sector_high_risk"], "priority": "urgent", "file_str_to_camfiu": True})
+    case = reg.invoke("open_compliance_case", {"customer_id": "CUST-TEST2", "risk_level": "high", "summary": "Suspicious cash flows and gambling links", "flags": ["gambling_sector_high_risk"], "priority": "urgent", "file_str_to_camfiu": True, "customer_pii": {"full_name": "Suspect KYC", "nationality": "KH"}})
     assert "error" not in case
     assert case["risk_level"] == "high"
     assert case["status"] == "open"

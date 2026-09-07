@@ -1,17 +1,20 @@
 """
 Core Banking Tool — MCP tool stub with SQLite persistence.
 
-In production this calls Sathapana's core banking system (Temenos/OLB).
-For the reference implementation, customers and accounts are stored in
-SQLite with USD/KHR currency support.
+PII is encrypted at rest (`customers.pii_encrypted`, Fernet) and decrypted on
+read. Only de-identified fields (risk_rating, currency, kyc_result, type)
+remain in plaintext indexable columns. In production this calls Sathapana's
+core banking system (Temenos/OLB); the identifiers are the same.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 
 import db
+from security import crypto
 
 ALLOWED_CURRENCIES = ("USD", "KHR")
 
@@ -22,16 +25,42 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def get_customer_pii(customer_id: str) -> dict | None:
+    """Return decrypted PII for a customer, or None if unknown."""
+    conn = db._connect()
+    try:
+        row = conn.execute("SELECT pii_encrypted FROM customers WHERE customer_id = ?", (customer_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["pii_encrypted"]:
+        return None
+    try:
+        return json.loads(crypto.decrypt(row["pii_encrypted"]))
+    except Exception:  # noqa: BLE001 — treat unreadable PII as unknown
+        return None
+
+
+def _pii_blob(personal_info: dict, address: dict) -> str:
+    pii = {
+        "full_name": personal_info.get("full_name") or personal_info.get("full_name_latin", "Unknown"),
+        "dob": personal_info.get("date_of_birth") or personal_info.get("dob"),
+        "nationality": personal_info.get("nationality", "KH"),
+        "address": {k: v for k, v in (address or {}).items() if v},
+    }
+    return crypto.encrypt(json.dumps(pii, ensure_ascii=False))
+
+
 def lookup_customer(identifier: str, query_type: str = "customer_lookup") -> dict:
     """Look up customer or account information in the core banking system."""
     db.init_db()
     conn = db._connect()
     try:
         if query_type == "customer_lookup":
-            row = conn.execute("SELECT * FROM customers WHERE customer_id = ? OR full_name = ?", (identifier, identifier)).fetchone()
+            row = conn.execute("SELECT * FROM customers WHERE customer_id = ?", (identifier,)).fetchone()
             if not row:
-                return {"customer_id": f"CUST-{uuid.uuid4().hex[:8].upper()}", "name": f"Prospective {identifier}", "status": "prospective", "kyc_status": "pending", "account_count": 0}
-            return {"customer_id": row["customer_id"], "name": row["full_name"], "status": row["kyc_result"], "kyc_status": row["kyc_result"], "risk_rating": row["risk_rating"], "currency": row["currency"], "account_count": 0}
+                return {"customer_id": f"CUST-{uuid.uuid4().hex[:8].upper()}", "name": f"Prospective {crypto.mask(identifier)}", "status": "prospective", "kyc_status": "pending", "account_count": 0}
+            pii = get_customer_pii(row["customer_id"]) or {"full_name": row["full_name"]}
+            return {"customer_id": row["customer_id"], "name": pii.get("full_name"), "status": row["kyc_result"], "kyc_status": row["kyc_result"], "risk_rating": row["risk_rating"], "currency": row["currency"], "customer_type": row["customer_type"], "account_count": 0, "pii": pii}
         if query_type == "account_status":
             row = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (identifier,)).fetchone()
             if not row:
@@ -52,7 +81,7 @@ def create_customer_profile(
     documents_verified: list[str] | None = None,
     kyc_case_id: str | None = None,
 ) -> dict:
-    """Create a customer profile after successful KYC."""
+    """Create a customer profile after successful KYC (PII encrypted at rest)."""
     db.init_db()
     if currency not in ALLOWED_CURRENCIES:
         return {"error": f"Currency must be one of {ALLOWED_CURRENCIES}"}
@@ -61,28 +90,28 @@ def create_customer_profile(
 
     customer_id = f"CUST-{uuid.uuid4().hex[:8].upper()}"
     created_at = _now()
-    conn = db._connect()
-    try:
+    pii_encrypted = _pii_blob(personal_info, address)
+    pseudonym = "tk:" + crypto.tokenize((personal_info.get("full_name") or personal_info.get("full_name_latin", "Unknown")))
+
+    with db.transaction() as conn:
         conn.execute(
-            "INSERT INTO customers (customer_id, full_name, customer_type, dob, nationality, currency, kyc_result, risk_rating, kyc_case_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO customers (customer_id, full_name, customer_type, dob, nationality, currency, kyc_result, risk_rating, kyc_case_id, pii_encrypted, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 customer_id,
-                personal_info.get("full_name", personal_info.get("full_name_latin", "Unknown")),
+                pseudonym,
                 customer_type,
-                personal_info.get("date_of_birth", personal_info.get("dob")),
-                personal_info.get("nationality", "KH"),
+                None,
+                None,
                 currency,
                 kyc_result,
                 risk_rating,
                 kyc_case_id,
+                pii_encrypted,
                 created_at,
             ),
         )
-        conn.commit()
-        db.log_action("core_banking", "create_customer_profile", {"customer_id": customer_id, "kyc_result": kyc_result, "risk_rating": risk_rating})
-    finally:
-        conn.close()
+        db.log_action("core_banking", "create_customer_profile", {"customer_id": customer_id, "kyc_result": kyc_result, "risk_rating": risk_rating}, "ok", conn=conn)
 
     return {
         "customer_id": customer_id,
@@ -90,6 +119,7 @@ def create_customer_profile(
         "currency": currency,
         "risk_rating": risk_rating,
         "documents_verified": documents_verified or [],
+        "pii_encrypted_at_rest": True,
         "created_at": created_at,
     }
 
@@ -106,8 +136,7 @@ def open_account(
     if currency not in ALLOWED_CURRENCIES:
         return {"error": f"Currency must be one of {ALLOWED_CURRENCIES}"}
 
-    conn = db._connect()
-    try:
+    with db.transaction() as conn:
         cust = conn.execute("SELECT * FROM customers WHERE customer_id = ?", (customer_id,)).fetchone()
         if not cust:
             return {"error": f"Customer {customer_id} not found"}
@@ -118,9 +147,6 @@ def open_account(
             "INSERT INTO accounts (account_id, customer_id, currency, account_type, status, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
             (account_id, customer_id, currency, account_type, "active", _now()),
         )
-        conn.commit()
-        db.log_action("core_banking", "open_account", {"account_id": account_id, "customer_id": customer_id, "currency": currency})
-    finally:
-        conn.close()
+        db.log_action("core_banking", "open_account", {"account_id": account_id, "customer_id": customer_id, "currency": currency}, "ok", conn=conn)
 
     return {"account_id": account_id, "customer_id": customer_id, "currency": currency, "account_type": account_type, "status": "active", "opened_at": _now()}
